@@ -1,0 +1,621 @@
+# Usque 端点检测 - WARP（API 版）
+# 主数据源: API /api/txt/warp-ipv4（上次验证有效的列表）
+# 附加数据源(可选): API /api/txt/warp-ips（每日提取的候选列表），不存在或为空则忽略
+# Secret: WARP_CONFIG_JSON = 完整 config.json 文本
+# Secret: WORKER_URL = 接口地址（只放 secret，不要写进 yml）
+# Secret: WORKERS_API_TOKEN = 接口 token（只放 secret，不要写进 yml）
+# 有效结果覆盖 API 的 warp-ipv4；有效=0 或 全部「未知」则不提交、不清空 warp-ips
+# 安全规则：提交前先读回当前值做临时备份，提交后读回校验；读/写失败最多重试 3 次；
+# 校验不通过则回退到备份。API 地址和 token 只走环境变量，绝不打印到日志。
+# 日志里的 IP 只显示前两段和最后一段，第三段打码，如 83.229.*.16。
+
+name: check-warp-ep-ips
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 每 30 分钟执行一次（UTC 时间）
+    - cron: '*/30 * * * *'
+
+permissions:
+  contents: write
+
+env:
+  CONNECT_TIMEOUT: "6"
+  API_TIMEOUT: "6"
+  API_RETRY: "2"
+  LOCAL_PORT_START: "4000"
+  PRIMARY_FILE: "warp-ipv4.txt"
+  EXTRA_FILE: "warp-ips.txt"
+  PRIMARY_KEY: "warp-ipv4"
+  EXTRA_KEY: "warp-ips"
+  USQUE_REPO: "Diniboy1123/usque"
+  SECRET_NAME: "WARP_CONFIG_JSON"
+  WORKER_URL: ${{ secrets.WORKER_URL }}
+  WORKERS_API_TOKEN: ${{ secrets.WORKERS_API_TOKEN }}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch sources from API
+        run: |
+          # API 地址和 token 只走环境变量，绝不 echo、不打到日志里。
+          if [ -z "$WORKER_URL" ] || [ -z "$WORKERS_API_TOKEN" ]; then
+            echo "缺少 WORKER_URL 或 WORKERS_API_TOKEN，请在仓库 Settings → Secrets 里添加这两个 secret。"
+            exit 1
+          fi
+          # api_get <key> <outfile>：读失败最多重试 3 次（共 4 次尝试）
+          api_get() {
+            local key="$1" out="$2" i=0
+            while [ $i -le 3 ]; do
+              if curl -fsSL -H "Authorization: Bearer $WORKERS_API_TOKEN" \
+                   "$WORKER_URL/api/txt/$key" -o "$out"; then
+                return 0
+              fi
+              i=$((i + 1))
+              [ $i -le 3 ] && sleep 2
+            done
+            return 1
+          }
+          # 主数据源必须读到，读不到就失败（不拿空列表去跑）
+          if ! api_get "$PRIMARY_KEY" "$PRIMARY_FILE"; then
+            echo "读主数据源失败（已重试 3 次），停止。"
+            exit 1
+          fi
+          echo "Primary: $PRIMARY_FILE ($(grep -cve '^[[:space:]]*$' "$PRIMARY_FILE" || true) lines)"
+          # 附加数据源读不到就当作不存在（跳过），不失败
+          if api_get "$EXTRA_KEY" "$EXTRA_FILE"; then
+            echo "Extra:   $EXTRA_FILE ($(grep -cve '^[[:space:]]*$' "$EXTRA_FILE" || true) lines)"
+          else
+            : > "$EXTRA_FILE"
+            echo "Extra:   $EXTRA_FILE (读不到或为空，跳过)"
+          fi
+
+      - name: Write config.json from secret
+        env:
+          CONFIG_JSON: ${{ secrets.WARP_CONFIG_JSON }}
+        run: |
+          if [ -z "$CONFIG_JSON" ]; then
+            echo "Secret WARP_CONFIG_JSON is empty. Add it in repo Settings → Secrets."
+            exit 1
+          fi
+          printf '%s\n' "$CONFIG_JSON" > config.json
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("config.json")
+          raw = p.read_text(encoding="utf-8-sig")
+          data = json.loads(raw)
+          p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print("config.json OK, keys:", sorted(data.keys()) if isinstance(data, dict) else type(data))
+          PY
+
+      - name: Download usque 3.0.1 (linux amd64)
+        run: |
+          set -e
+          URL="https://github.com/${USQUE_REPO}/releases/download/v3.0.1/usque_3.0.1_linux_amd64.zip"
+          echo "Downloading: $URL"
+          curl -fsSL -o usque_asset.zip "$URL"
+          rm -rf usque_extract
+          mkdir -p usque_extract
+          unzip -o usque_asset.zip -d usque_extract
+          FOUND=$(find usque_extract -type f -name 'usque' | head -n1)
+          if [ -z "$FOUND" ]; then
+            echo "usque binary not found after extract"
+            find usque_extract -type f
+            exit 1
+          fi
+          cp -f "$FOUND" ./usque
+          chmod +x ./usque
+          ./usque --help >/dev/null 2>&1 || ./usque -h >/dev/null 2>&1 || true
+          echo "usque ready"
+          ls -la ./usque
+
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq curl || true
+
+      - name: Run endpoint checker
+        id: check
+        run: |
+          python3 << 'PY'
+          import json, os, re, subprocess, time, pathlib, socket
+
+          CONNECT_TIMEOUT = int(os.environ.get("CONNECT_TIMEOUT", "5"))
+          API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "10"))
+          API_RETRY = int(os.environ.get("API_RETRY", "2"))
+          LOCAL_PORT = int(os.environ.get("LOCAL_PORT_START", "5000"))
+          PRIMARY_FILE = os.environ.get("PRIMARY_FILE", "warp-ipv4.txt")
+          EXTRA_FILE = os.environ.get("EXTRA_FILE", "warp-ips.txt")
+          USQUE = os.path.abspath("./usque")
+          CONFIG = "config.json"
+          API_URL = "https://api.ip2location.io/"
+
+          # 剔除列表：这些 IP 不参与有效性验证
+          BLACKLIST_IPS = [
+              # 在这里添加需要剔除的 IP，例如：
+              # "1.2.3.4",
+              # "211.47.66.131",
+          ]
+
+          COUNTRY = {
+          "AF":"阿富汗","AL":"阿尔巴尼亚","DZ":"阿尔及利亚","AS":"美属萨摩亚","AD":"安道尔",
+          "AO":"安哥拉","AI":"安圭拉","AQ":"南极洲","AG":"安提瓜和巴布达","AR":"阿根廷",
+          "AM":"亚美尼亚","AW":"阿鲁巴","AU":"澳大利亚","AT":"奥地利","AZ":"阿塞拜疆",
+          "BS":"巴哈马","BH":"巴林","BD":"孟加拉国","BB":"巴巴多斯","BY":"白俄罗斯",
+          "BE":"比利时","BZ":"伯利兹","BJ":"贝宁","BM":"百慕大","BT":"不丹",
+          "BO":"玻利维亚","BA":"波黑","BW":"博茨瓦纳","BR":"巴西","BN":"文莱",
+          "BG":"保加利亚","BF":"布基纳法索","BI":"布隆迪","KH":"柬埔寨","CM":"喀麦隆",
+          "CA":"加拿大","CV":"佛得角","KY":"开曼群岛","CF":"中非","TD":"乍得",
+          "CL":"智利","CN":"中国","CX":"圣诞岛","CC":"科科斯群岛","CO":"哥伦比亚",
+          "KM":"科摩罗","CG":"刚果（布）","CD":"刚果（金）","CK":"库克群岛","CR":"哥斯达黎加",
+          "CI":"科特迪瓦","HR":"克罗地亚","CU":"古巴","CY":"塞浦路斯","CZ":"捷克",
+          "DK":"丹麦","DJ":"吉布提","DM":"多米尼克","DO":"多米尼加","EC":"厄瓜多尔",
+          "EG":"埃及","SV":"萨尔瓦多","GQ":"赤道几内亚","ER":"厄立特里亚","EE":"爱沙尼亚",
+          "ET":"埃塞俄比亚","FK":"福克兰群岛","FO":"法罗群岛","FJ":"斐济","FI":"芬兰",
+          "FR":"法国","GF":"法属圭亚那","PF":"法属波利尼西亚","GA":"加蓬","GM":"冈比亚",
+          "GE":"格鲁吉亚","DE":"德国","GH":"加纳","GI":"直布罗陀","GR":"希腊",
+          "GL":"格陵兰","GD":"格林纳达","GP":"瓜德罗普","GU":"关岛","GT":"危地马拉",
+          "GG":"根西岛","GN":"几内亚","GW":"几内亚比绍","GY":"圭亚那","HT":"海地",
+          "HN":"洪都拉斯","HK":"香港","HU":"匈牙利","IS":"冰岛","IN":"印度",
+          "ID":"印度尼西亚","IR":"伊朗","IQ":"伊拉克","IE":"爱尔兰","IM":"马恩岛",
+          "IL":"以色列","IT":"意大利","JM":"牙买加","JP":"日本","JE":"泽西岛",
+          "JO":"约旦","KZ":"哈萨克斯坦","KE":"肯尼亚","KI":"基里巴斯","KP":"朝鲜",
+          "KR":"韩国","KW":"科威特","KG":"吉尔吉斯斯坦","LA":"老挝","LV":"拉脱维亚",
+          "LB":"黎巴嫩","LS":"莱索托","LR":"利比里亚","LY":"利比亚","LI":"列支敦士登",
+          "LT":"立陶宛","LU":"卢森堡","MO":"澳门","MK":"北马其顿","MG":"马达加斯加",
+          "MW":"马拉维","MY":"马来西亚","MV":"马尔代夫","ML":"马里","MT":"马耳他",
+          "MH":"马绍尔群岛","MQ":"马提尼克","MR":"毛里塔尼亚","MU":"毛里求斯","YT":"马约特",
+          "MX":"墨西哥","FM":"密克罗尼西亚","MD":"摩尔多瓦","MC":"摩纳哥","MN":"蒙古",
+          "ME":"黑山","MS":"蒙特塞拉特","MA":"摩洛哥","MZ":"莫桑比克","MM":"缅甸",
+          "NA":"纳米比亚","NR":"瑙鲁","NP":"尼泊尔","NL":"荷兰","NC":"新喀里多尼亚",
+          "NZ":"新西兰","NI":"尼加拉瓜","NE":"尼日尔","NG":"尼日利亚","NU":"纽埃",
+          "NF":"诺福克岛","MP":"北马里亚纳群岛","NO":"挪威","OM":"阿曼","PK":"巴基斯坦",
+          "PW":"帕劳","PS":"巴勒斯坦","PA":"巴拿马","PG":"巴布亚新几内亚","PY":"巴拉圭",
+          "PE":"秘鲁","PH":"菲律宾","PN":"皮特凯恩群岛","PL":"波兰","PT":"葡萄牙",
+          "PR":"波多黎各","QA":"卡塔尔","RE":"留尼汪","RO":"罗马尼亚","RU":"俄罗斯",
+          "RW":"卢旺达","BL":"圣巴泰勒米","SH":"圣赫勒拿","KN":"圣基茨和尼维斯","LC":"圣卢西亚",
+          "MF":"法属圣马丁","PM":"圣皮埃尔和密克隆","VC":"圣文森特和格林纳丁斯","WS":"萨摩亚","SM":"圣马力诺",
+          "ST":"圣多美和普林西比","SA":"沙特阿拉伯","SN":"塞内加尔","RS":"塞尔维亚","SC":"塞舌尔",
+          "SL":"塞拉利昂","SG":"新加坡","SX":"荷属圣马丁","SK":"斯洛伐克","SI":"斯洛文尼亚",
+          "SB":"所罗门群岛","SO":"索马里","ZA":"南非","GS":"南乔治亚岛","SS":"南苏丹",
+          "ES":"西班牙","LK":"斯里兰卡","SD":"苏丹","SR":"苏里南","SJ":"斯瓦尔巴和扬马延",
+          "SZ":"斯威士兰","SE":"瑞典","CH":"瑞士","SY":"叙利亚","TW":"台湾",
+          "TJ":"塔吉克斯坦","TZ":"坦桑尼亚","TH":"泰国","TL":"东帝汶","TG":"多哥",
+          "TK":"托克劳","TO":"汤加","TT":"特立尼达和多巴哥","TN":"突尼斯","TR":"土耳其",
+          "TM":"土库曼斯坦","TC":"特克斯和凯科斯群岛","TV":"图瓦卢","UG":"乌干达","UA":"乌克兰",
+          "AE":"阿联酋","GB":"英国","US":"美国","UM":"美国本土外小岛屿","UY":"乌拉圭",
+          "UZ":"乌兹别克斯坦","VU":"瓦努阿图","VE":"委内瑞拉","VN":"越南","VG":"英属维尔京群岛",
+          "VI":"美属维尔京群岛","WF":"瓦利斯和富图纳","EH":"西撒哈拉","YE":"也门","ZM":"赞比亚",
+          "ZW":"津巴布韦","XK":"科索沃",
+          }
+
+          # 日志里的 IP 只留前两段和最后一段，第三段打码（如 83.229.*.16），
+          # 仓库公开也看不到确切 IP；写进文件里的完整 IP 不动。
+          def mask_ip(ip):
+              parts = str(ip).split(".")
+              return f"{parts[0]}.{parts[1]}.*.{parts[3]}" if len(parts) == 4 else ip
+
+          def mask_ip_text(s):
+              return re.sub(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b",
+                            r"\1.\2.*.\4", s or "")
+
+          def is_ipv4(s):
+              return bool(re.match(r"^\d{1,3}(\.\d{1,3}){3}$", s))
+
+          def country_name(cc):
+              return COUNTRY.get(cc.upper(), cc)
+
+          def stop_usque():
+              subprocess.run(["pkill", "-9", "-f", "[u]sque"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+              time.sleep(0.6)
+
+          def update_endpoint(ip):
+              p = pathlib.Path(CONFIG)
+              data = json.loads(p.read_text(encoding="utf-8"))
+              data["endpoint_v4"] = ip
+              p.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+          def port_open(port, host="127.0.0.1", timeout=0.4):
+              try:
+                  with socket.create_connection((host, port), timeout=timeout):
+                      return True
+              except OSError:
+                  return False
+
+          def parse_cc(text):
+              if not text:
+                  return None
+              m = re.search(r'"country_code"\s*:\s*"([A-Z]{2})"', text)
+              return m.group(1) if m else None
+
+          def curl_api(local_port, timeout):
+              cmd = [
+                  "curl", "-s",
+                  "-x", f"socks5h://127.0.0.1:{local_port}",
+                  "--max-time", str(timeout),
+                  API_URL,
+              ]
+              try:
+                  r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 3)
+                  return r.stdout or ""
+              except Exception:
+                  return ""
+
+          def start_usque(local_port, remote_port, log_path):
+              stop_usque()
+              logf = open(log_path, "w", encoding="utf-8", buffering=1)
+              proc = subprocess.Popen(
+                  [USQUE, "socks", "-b", "127.0.0.1", "-p", str(local_port), "-P", str(remote_port)],
+                  stdout=logf,
+                  stderr=subprocess.STDOUT,
+                  text=True,
+              )
+              return proc, logf
+
+          def read_log(path):
+              try:
+                  return pathlib.Path(path).read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  return ""
+
+          def parse_ip_port_lines(text):
+              items = []
+              for line in text.splitlines():
+                  clean = re.sub(r"\s+", "", line)
+                  if not clean:
+                      continue
+                  m = re.match(r"^([^:@]+):(\d+)", clean)
+                  if m:
+                      items.append((m.group(1), m.group(2)))
+              return items
+
+          # 合并主数据源 + 可选附加数据源（去重，保序）
+          primary_text = pathlib.Path(PRIMARY_FILE).read_text(encoding="utf-8", errors="ignore")
+          items = parse_ip_port_lines(primary_text)
+          seen = set(items)
+          extra_path = pathlib.Path(EXTRA_FILE)
+          if extra_path.is_file():
+              extra_text = extra_path.read_text(encoding="utf-8", errors="ignore")
+              extra_items = parse_ip_port_lines(extra_text)
+              if extra_items:
+                  added = 0
+                  for it in extra_items:
+                      if it not in seen:
+                          items.append(it)
+                          seen.add(it)
+                          added += 1
+                  print(f"Merged extra {EXTRA_FILE}: +{added} unique (raw {len(extra_items)})")
+              else:
+                  print(f"Extra {EXTRA_FILE} is empty, ignore")
+          else:
+              print(f"Extra {EXTRA_FILE} not found, ignore")
+
+          # 剔除黑名单 IP
+          blacklist_set = set(BLACKLIST_IPS)
+          original_count = len(items)
+          items = [(ip, port) for ip, port in items if ip not in blacklist_set]
+          skipped = original_count - len(items)
+          if skipped:
+              print(f"Skipped {skipped} endpoints from blacklist")
+
+          print(f"Total endpoints to test: {len(items)}")
+          results = []
+          local_port = LOCAL_PORT
+
+          for idx, (ip, rport) in enumerate(items, 1):
+              print(f"\n[{idx}] test {mask_ip(ip)}:{rport}  local:{local_port}")
+              if not is_ipv4(ip):
+                  print("    [SKIP] not IPv4")
+                  local_port += 1
+                  continue
+
+              try:
+                  update_endpoint(ip)
+              except Exception as e:
+                  print(f"    [FAIL] config update: {e}")
+                  local_port += 1
+                  continue
+
+              log_path = f"usque_{local_port}.log"
+              try:
+                  if os.path.exists(log_path):
+                      os.remove(log_path)
+              except Exception:
+                  pass
+
+              proc, logf = start_usque(local_port, rport, log_path)
+
+              ready = False
+              for _ in range(20):
+                  time.sleep(0.35)
+                  if port_open(local_port):
+                      ready = True
+                      break
+                  if "listening on" in read_log(log_path):
+                      ready = True
+                      break
+                  if proc.poll() is not None:
+                      break
+
+              if not ready:
+                  print("    [FAIL] local port not ready")
+                  log = read_log(log_path).strip()
+                  if log:
+                      print("    ---- usque log ----")
+                      print(mask_ip_text(log))
+                      print("    -------------------")
+                  try:
+                      logf.close()
+                  except Exception:
+                      pass
+                  stop_usque()
+                  local_port += 1
+                  continue
+
+              curl_cmd = [
+                  "curl", "-s",
+                  "-x", f"socks5h://127.0.0.1:{local_port}",
+                  "--max-time", str(API_TIMEOUT),
+                  "-o", f"resp_{local_port}.txt",
+                  API_URL,
+              ]
+              curl_proc = subprocess.Popen(curl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+              connected = False
+              early_ok = False
+              deadline = time.time() + CONNECT_TIMEOUT
+              while time.time() < deadline:
+                  time.sleep(0.12)
+                  log = read_log(log_path)
+                  if "Connected to MASQUE server" in log:
+                      connected = True
+                      break
+                  if curl_proc.poll() is not None:
+                      resp = ""
+                      try:
+                          resp = pathlib.Path(f"resp_{local_port}.txt").read_text(encoding="utf-8", errors="ignore")
+                      except Exception:
+                          pass
+                      if parse_cc(resp):
+                          early_ok = True
+                      if "Connected to MASQUE server" in read_log(log_path):
+                          connected = True
+                      break
+
+              if not connected and not early_ok:
+                  print(f"    [FAIL] no MASQUE connect within {CONNECT_TIMEOUT}s after API start")
+                  if curl_proc.poll() is None:
+                      curl_proc.kill()
+                  log = read_log(log_path).strip()
+                  if log:
+                      print("    ---- usque log ----")
+                      print(mask_ip_text(log))
+                      print("    -------------------")
+                  try:
+                      logf.close()
+                  except Exception:
+                      pass
+                  stop_usque()
+                  local_port += 1
+                  continue
+
+              print("    [..] Connected / early OK, waiting API...")
+              if curl_proc.poll() is None:
+                  try:
+                      curl_proc.wait(timeout=API_TIMEOUT + 2)
+                  except subprocess.TimeoutExpired:
+                      curl_proc.kill()
+
+              resp = ""
+              try:
+                  resp = pathlib.Path(f"resp_{local_port}.txt").read_text(encoding="utf-8", errors="ignore")
+              except Exception:
+                  pass
+              cc = parse_cc(resp)
+
+              attempt = 1
+              while not cc and attempt <= API_RETRY:
+                  attempt += 1
+                  print(f"    [..] API fail, retry {attempt}/{1+API_RETRY}...")
+                  time.sleep(0.4)
+                  resp = curl_api(local_port, API_TIMEOUT)
+                  cc = parse_cc(resp)
+
+              if cc:
+                  name = country_name(cc)
+                  print(f"    [OK] {mask_ip(ip)}:{rport}  ->  {name} ({cc})")
+              else:
+                  name = "未知"
+                  print(f"    [OK] {mask_ip(ip)}:{rport}  ->  未知 (API failed, MASQUE connected)")
+
+              results.append(f"{ip}:{rport}@{name} | {ip} | {rport} | MASQUE导航")           
+
+              try:
+                  logf.close()
+              except Exception:
+                  pass
+              if proc.poll() is None:
+                  try:
+                      proc.kill()
+                  except Exception:
+                      pass
+              stop_usque()
+              local_port += 1
+
+          stop_usque()
+          print("\n========================================")
+          print(f"  Done  total_source={len(items)}  valid={len(results)}")
+          print("========================================")
+
+          if not results:
+              print("No valid endpoints → skip commit")
+              pathlib.Path("check_should_commit").write_text("0\n", encoding="utf-8")
+              raise SystemExit(0)
+
+          def region_of(line):
+              # ip:port@NAME | ...
+              try:
+                  return line.split("@", 1)[1].split("|", 1)[0].strip()
+              except Exception:
+                  return "未知"
+
+          if all(region_of(line) == "未知" for line in results):
+              print("All regions are 未知 → skip commit")
+              pathlib.Path("check_should_commit").write_text("0\n", encoding="utf-8")
+              raise SystemExit(0)
+
+          # ========== 需求2：同一 IP 多端口处理（优先新端口，最多保留5个） ==========
+          # 解析旧文件中的 (ip, port) 作为“旧端口”
+          old_items = parse_ip_port_lines(primary_text)
+          old_set = set(old_items)
+
+          # 按 IP 分组当前有效结果
+          from collections import defaultdict
+          ip_groups = defaultdict(list)  # ip -> list of (port, line, is_new)
+          for line in results:
+              try:
+                  left = line.split("|", 1)[0].strip()
+                  ip_port, name = left.split("@", 1)
+                  ip, port = ip_port.split(":", 1)
+                  is_new = (ip, port) not in old_set
+                  ip_groups[ip].append((port, line, is_new))
+              except Exception:
+                  continue
+
+          final_results = []
+          for ip, entries in ip_groups.items():
+              # 新端口优先，然后按端口号排序保证稳定
+              entries.sort(key=lambda x: (not x[2], int(x[0]) if x[0].isdigit() else 0))
+              # 最多保留 5 个
+              kept = entries[:5]
+              final_results.extend([e[1] for e in kept])
+
+          results = final_results
+
+          # ========== 需求1：最终排序（相同地区挨在一起，优先顺序：日本 > 韩国 > 新加坡 > 香港） ==========
+          PRIORITY = {
+              "日本": 0,
+              "香港": 1,
+              "韩国": 2,
+              "新加坡": 3,
+          }
+
+          def sort_key(line):
+              region = region_of(line)
+              prio = PRIORITY.get(region, 100)  # 其它地区排后面
+              return (prio, region, line)
+
+          results.sort(key=sort_key)
+
+          # 强制让最终文件第一行带上日期，最后一行改成 masque.pages.dev
+          if results:
+              import datetime
+              bj_now = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=8)))
+              time_str = bj_now.strftime("%m-%d %H:%M")
+
+              # 第一行
+              first = results[0]
+              parts = first.rsplit("|", 1)
+              if len(parts) == 2:
+                  results[0] = parts[0] + f"| WARP {time_str}"
+
+              # 最后一行
+              if len(results) > 1:
+                  last = results[-1]
+                  parts = last.rsplit("|", 1)
+                  if len(parts) == 2:
+                      results[-1] = parts[0] + "| masque.pages.dev"
+
+          pathlib.Path(PRIMARY_FILE).parent.mkdir(parents=True, exist_ok=True)
+          pathlib.Path(PRIMARY_FILE).write_text("\n".join(results) + "\n", encoding="utf-8")
+          
+          try:
+              pathlib.Path(EXTRA_FILE).write_text("", encoding="utf-8")
+              print(f"Cleared all text in {EXTRA_FILE}")
+          except Exception as e:
+              print(f"Failed to clear {EXTRA_FILE}: {e}")  
+              
+          pathlib.Path("check_should_commit").write_text("1\n", encoding="utf-8")
+          print(f"Wrote {len(results)} lines to {PRIMARY_FILE}")
+          PY
+
+      - name: Upload valid list to API
+        if: success()
+        run: |
+          # 只有检测出有效结果才上传；check_should_commit 由检测脚本写（1=上传，0=跳过）
+          if [ ! -f check_should_commit ] || [ "$(cat check_should_commit)" != "1" ]; then
+            echo "Skip upload (no valid endpoints or all regions unknown)"
+            exit 0
+          fi
+          if [ -z "$WORKER_URL" ] || [ -z "$WORKERS_API_TOKEN" ]; then
+            echo "缺少 WORKER_URL 或 WORKERS_API_TOKEN"
+            exit 1
+          fi
+          # api_get <key> <outfile> / api_put <key> <file>：失败最多重试 3 次（共 4 次尝试）
+          api_get() {
+            local key="$1" out="$2" i=0
+            while [ $i -le 3 ]; do
+              if curl -fsSL -H "Authorization: Bearer $WORKERS_API_TOKEN" \
+                   "$WORKER_URL/api/txt/$key" -o "$out"; then
+                return 0
+              fi
+              i=$((i + 1))
+              [ $i -le 3 ] && sleep 2
+            done
+            return 1
+          }
+          api_put() {
+            local key="$1" file="$2" i=0
+            while [ $i -le 3 ]; do
+              if curl -fsSL -X PUT -H "Authorization: Bearer $WORKERS_API_TOKEN" \
+                   -H "Content-Type: text/plain" --data-binary @"$file" \
+                   "$WORKER_URL/api/txt/$key?source=github-actions"; then
+                return 0
+              fi
+              i=$((i + 1))
+              [ $i -le 3 ] && sleep 2
+            done
+            return 1
+          }
+          # 1) 提交前先读回当前值，做临时备份
+          BACKUP_EXISTS=0
+          if api_get "$PRIMARY_KEY" warp-ipv4-backup.txt; then
+            BACKUP_EXISTS=1
+            echo "已备份当前 warp-ipv4（$(grep -cve '^[[:space:]]*$' warp-ipv4-backup.txt || true) 行）"
+          else
+            echo "当前 API 里没有 warp-ipv4（首次写入，无备份）"
+          fi
+          # 2) 提交新结果
+          if ! api_put "$PRIMARY_KEY" "$PRIMARY_FILE"; then
+            echo "提交 warp-ipv4 失败（已重试 3 次），线上数据未动。"
+            exit 1
+          fi
+          # 3) 提交后读回校验：内容必须和本地文件完全一致
+          ROLLBACK_NEEDED=0
+          if api_get "$PRIMARY_KEY" warp-ipv4-verify.txt; then
+            cmp -s "$PRIMARY_FILE" warp-ipv4-verify.txt || ROLLBACK_NEEDED=1
+          else
+            echo "校验读取失败（已重试 3 次）"
+            ROLLBACK_NEEDED=1
+          fi
+          if [ "$ROLLBACK_NEEDED" = "1" ]; then
+            echo "校验不通过，回退到提交前的备份。"
+            if [ "$BACKUP_EXISTS" = "1" ]; then
+              api_put "$PRIMARY_KEY" warp-ipv4-backup.txt || true
+            else
+              curl -fsSL -X DELETE -H "Authorization: Bearer $WORKERS_API_TOKEN" \
+                "$WORKER_URL/api/txt/$PRIMARY_KEY" || true
+            fi
+            exit 1
+          fi
+          echo "已上传 warp-ipv4（$(grep -cve '^[[:space:]]*$' "$PRIMARY_FILE" || true) 行），校验通过。"
+          # 4) 校验通过后，清空附加数据源 warp-ips（下次提取会重新填）
+          if curl -fsSL -X DELETE -H "Authorization: Bearer $WORKERS_API_TOKEN" \
+               "$WORKER_URL/api/txt/$EXTRA_KEY"; then
+            echo "已清空 warp-ips"
+          else
+            echo "清空 warp-ips 失败（下次提取会覆盖，不影响）"
+          fi
