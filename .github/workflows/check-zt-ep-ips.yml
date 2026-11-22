@@ -13,9 +13,9 @@ name: check-zt-ep-ips
 
 on:
   workflow_dispatch:
-  schedule:
-    # 每 30 分钟执行一次（UTC 时间）
-    - cron: '0 * * * *'
+  #schedule:
+    # 每 30 分钟执行一次（UTC 时间） 改为muse触发
+    #- cron: '0 * * * *'
 
 permissions:
   contents: write
