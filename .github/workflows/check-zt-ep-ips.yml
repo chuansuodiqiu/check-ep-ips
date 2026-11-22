@@ -15,7 +15,7 @@ on:
   workflow_dispatch:
   schedule:
     # 每 30 分钟执行一次（UTC 时间）
-    - cron: '*/30 * * * *'
+    - cron: '0 * * * *'
 
 permissions:
   contents: write
